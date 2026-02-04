@@ -7,6 +7,8 @@ import glob
 import re
 from collections import defaultdict
 import datetime
+import bisect
+import gc
 
 # --- Configuration ---
 DEFAULT_TOLERANCE = 1.0  # Default amount tolerance if not specified
@@ -87,6 +89,8 @@ def get_header_map(ws):
     return mapping
 
 class Invoice:
+    __slots__ = ['row_idx', 'gstin', 'igst', 'cgst', 'sgst', 'party', 'head', 'amount', 'source', 'match_id', 'match_type', 'matched_with_row']
+
     def __init__(self, row_idx, data, source_sheet):
         self.row_idx = row_idx
         self.gstin = str(data.get('gstin', '') or '').strip().upper()
@@ -260,6 +264,12 @@ def match_invoices(list1, list2, tolerance, name1, name2):
             best_match.matched_with_row = inv1.row_idx
             match_counter += 1
 
+    # Free up memory explicitly
+    map2_no_gstin.clear()
+    map2_with_gstin.clear()
+    map2.clear()
+    gc.collect()
+
     # --- Phase 3: Amount Match (GSTIN Mismatch / Both have different GSTINs or both missing) ---
     print("Running Phase 3: Amount Only Matches...")
     
@@ -269,19 +279,55 @@ def match_invoices(list1, list2, tolerance, name1, name2):
         if not inv.match_id:
             map2_any[inv.head].append(inv)
             
+    # Sort candidates by amount for binary search
+    sorted_candidates_map = {}
+    candidates_amounts_map = {} # Pre-calculate amounts for bisect
+    
+    for head, items in map2_any.items():
+        # filtering out items that might have been matched in previous phases
+        valid_items = [x for x in items if not x.match_id]
+        valid_items.sort(key=lambda x: x.amount)
+        sorted_candidates_map[head] = valid_items
+        candidates_amounts_map[head] = [x.amount for x in valid_items]
+        
     for inv1 in list1:
         if inv1.match_id: continue
         
-        candidates = map2_any.get(inv1.head, [])
+        candidates = sorted_candidates_map.get(inv1.head, [])
+        candidate_amounts = candidates_amounts_map.get(inv1.head, [])
+        
+        if not candidates: continue
+        
+        # Binary search using pre-calculated list
+        idx = bisect.bisect_left(candidate_amounts, inv1.amount)
+        
         best_match = None
         best_diff = float('inf')
         
-        for candidate in candidates:
-            if candidate.match_id: continue
-            diff = abs(inv1.amount - candidate.amount)
-            if diff <= tolerance and diff < best_diff:
+        # Check right side (including idx)
+        for i in range(idx, len(candidates)):
+            # Optimization: strictly sorted
+            diff = abs(candidates[i].amount - inv1.amount)
+            if diff > tolerance:
+                break 
+            
+            if candidates[i].match_id: continue
+            
+            if diff < best_diff:
                 best_diff = diff
-                best_match = candidate
+                best_match = candidates[i]
+                
+        # Check left side
+        for i in range(idx - 1, -1, -1):
+            diff = abs(candidates[i].amount - inv1.amount)
+            if diff > tolerance:
+                break
+                
+            if candidates[i].match_id: continue
+            
+            if diff < best_diff:
+                best_diff = diff
+                best_match = candidates[i]
         
         if best_match:
             inv1.match_id = match_counter
